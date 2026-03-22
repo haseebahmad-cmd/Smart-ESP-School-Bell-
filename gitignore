@@ -1,0 +1,45 @@
+# Arduino build output
+build/
+*.bin
+*.elf
+*.hex
+*.map
+
+# Arduino IDE preferences and cache
+.arduino15/
+.arduinoIDE/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+
+# PlatformIO (if you ever migrate)
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# LittleFS data folder (filesystem image, generated at build time)
+data/
+
+# Serial logs / captures
+*.log
+
+# Credentials backup (never commit real WiFi passwords)
+secrets.h
+credentials.h
+config_local.h
