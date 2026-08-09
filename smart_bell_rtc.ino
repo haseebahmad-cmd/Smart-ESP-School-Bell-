@@ -1,73 +1,214 @@
 /****************************************************
-   - SMART BELL
-   - Static IP: 192.168.100.27
-   - Per-Event Duration (Each bell has its own time)
-   - DS3231 RTC fallback when WiFi/NTP unavailable
-   - Auto WiFi reconnection
-   - Fixed relay pin (D5) - D1/D2 freed for I2C (RTC)
-
-   WIRING:
-     DS3231 SDA  -> D2 (GPIO4)
-     DS3231 SCL  -> D1 (GPIO5)   <-- was relay, now I2C SCL
-     Relay       -> D5 (GPIO14)  <-- moved from D1
-     DS3231 VCC  -> 3.3V
-     DS3231 GND  -> GND
-****************************************************/
+ *  SMART BELL — v2
+ *  Nasir Higher Secondary School, Rabwah
+ *
+ *  ESP8266 + DS3231 RTC automated bell controller.
+ *  Static IP, per-event duration, RTC fallback,
+ *  auto WiFi reconnect, LittleFS persistence.
+ *
+ *  ------------------------------------------------
+ *  WHAT CHANGED IN v2 (read before flashing)
+ *  ------------------------------------------------
+ *  1. FIXED — wrong bell times on cold boot w/o WiFi.
+ *     v1 only set the TZ (via configTime) *after* a
+ *     successful WiFi connect. If the board booted with
+ *     no WiFi (power cut + router down), the RTC path's
+ *     mktime()/localtime() calls ran with no TZ set and
+ *     produced UTC instead of PKT — every bell fired ~5h
+ *     off, silently. TZ is now configured unconditionally
+ *     at boot, before WiFi is even attempted.
+ *
+ *  2. FIXED — state-changing routes were plain GET links
+ *     (/del, /clear). A link-prefetching browser, a LAN
+ *     security scanner, or anyone with the URL could wipe
+ *     the schedule with no server-side protection (the
+ *     confirm() dialog was client-side only). All mutating
+ *     endpoints are now POST-only.
+ *
+ *  3. FIXED — the "enabled" field existed in the data
+ *     model but nothing ever set it false. There was no
+ *     way to pause a bell without deleting it. Added a
+ *     real enable/disable toggle.
+ *
+ *  4. ADDED — editing an event in place (previously the
+ *     only option was delete + re-add).
+ *
+ *  5. ADDED — optional short label per event (e.g. "Period
+ *     1", "Assembly", "Home Time").
+ *
+ *  6. REBUILT page delivery for the ESP8266's memory
+ *     limits. v1 rebuilt the entire HTML page from ~100+
+ *     String concatenations on *every* request, growing
+ *     with the event count. Repeated String += on this
+ *     chip fragments its small heap and is a common cause
+ *     of these boards hanging after days/weeks of uptime.
+ *     v2 serves one static HTML/CSS/JS shell straight from
+ *     flash (PROGMEM) and exposes a small JSON API; the
+ *     browser renders/sorts the event list client-side.
+ *
+ *  7. ADDED — basic self-healing for a device that runs
+ *     unattended for months: a periodic free-heap check
+ *     that restarts the board if memory gets critically
+ *     low, and a nightly 03:00 restart (skipped if a bell
+ *     is mid-ring) to clear any slow memory creep before
+ *     it becomes a mid-school-day problem.
+ *
+ *  8. ADDED — automatic one-time migration of existing
+ *     data.json files from v1's 12h+AM/PM format to v2's
+ *     internal 24h format, so upgrading does not wipe an
+ *     existing schedule.
+ *
+ *  9. Uses ArduinoJson 7.x (JsonDocument, elastic capacity)
+ *     instead of the v6 DynamicJsonDocument API, which is
+ *     deprecated as of ArduinoJson 7.
+ *
+ *  10. ADDED — login for the web panel (username + password,
+ *      session cookie, single shared admin account). Plain
+ *      HTTP, not HTTPS: this stops casual/opportunistic
+ *      access on the LAN, not someone actively sniffing
+ *      traffic. Password can be changed from the dashboard
+ *      once logged in; "forgot password" is a physical
+ *      recovery button (see wiring below) rather than an
+ *      email/SMS flow, since this device has no such channel
+ *      and adding one (SMTP client, stored mail credentials)
+ *      would be a lot of new failure surface for very little
+ *      real benefit here.
+ *
+ *  NOT changed: wiring, relay pin, RTC library, overall
+ *  WiFi/NTP/RTC fallback strategy — all of that was sound.
+ *
+ *  IMPORTANT: this was rewritten and reviewed carefully,
+ *  but has not been compiled/flash-tested on real hardware
+ *  in this environment. Test on a bench unit before
+ *  deploying to the live bell circuit — see README.
+ *
+ *  WIRING (unchanged from v1):
+ *    DS3231 SDA -> D2 (GPIO4)
+ *    DS3231 SCL -> D1 (GPIO5)
+ *    DS3231 VCC -> 3.3V     DS3231 GND -> GND
+ *    Relay IN   -> D5 (GPIO14)   <- do not use D1/D2, reserved for I2C
+ *    Relay VCC  -> 5V        Relay GND -> GND
+ *
+ *  WIRING (new — early-warning LED):
+ *    LED anode -> 220-330 ohm resistor -> D7 (GPIO13)
+ *    LED cathode -> GND
+ *    Behaviour: strobes slowly starting 10s before a scheduled bell,
+ *    then strobes faster for the duration of the actual ring.
+ *
+ *  WIRING (new — password reset button):
+ *    Momentary pushbutton -> D6 (GPIO12) and the other leg -> GND
+ *    No resistor needed (uses the internal pull-up).
+ *    Behaviour: hold for 5s while powering on the board to wipe the
+ *    saved password and force it back to ADMIN_PASSWORD_DEFAULT
+ *    (defined below). LED flashes 5x fast to confirm it happened.
+ *    Optional — the device works fine without this button wired up;
+ *    you'd just lose the physical-recovery option if you forget a
+ *    changed password.
+ ****************************************************/
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <LittleFS.h>
-#include <ArduinoJson.h>
+#include <ArduinoJson.h>       // Requires ArduinoJson 7.x
 #include <Wire.h>
-#include <RTClib.h>   // Adafruit RTClib library
+#include <RTClib.h>            // Adafruit RTClib
 #include <time.h>
 
-// ---------------- CONFIGURATION ----------------
-const char* ssid     = "your ssid";
-const char* password = "password";
+// ---------------------------------------------------------
+// DEBUG SERIAL
+// ---------------------------------------------------------
+// Set to 1 to re-enable USB serial logging for bench troubleshooting.
+// Leave at 0 for the deployed, plug-and-forget unit: this compiles the
+// logging out entirely (saves a bit of flash/IRAM, which was already
+// close to its ceiling) and leaves the TX/RX pins completely unused.
+#define DEBUG_SERIAL 0
 
-// STATIC IP SETTINGS
+#if DEBUG_SERIAL
+  #define DBG_BEGIN(baud)   Serial.begin(baud)
+  #define DBG_PRINT(...)    Serial.print(__VA_ARGS__)
+  #define DBG_PRINTLN(...)  Serial.println(__VA_ARGS__)
+  #define DBG_PRINTF(...)   Serial.printf(__VA_ARGS__)
+#else
+  #define DBG_BEGIN(baud)
+  #define DBG_PRINT(...)
+  #define DBG_PRINTLN(...)
+  #define DBG_PRINTF(...)
+#endif
+
+// ---------------------------------------------------------
+// CONFIGURATION — edit these for your deployment
+// ---------------------------------------------------------
+const char* ssid     = "ssid";
+const char* password = "pass";
+
+// Web panel login. Username is fixed; password can be changed later from
+// the dashboard (stored in LittleFS) — this is just the factory default,
+// and also what the physical recovery button restores it to.
+const char* ADMIN_USERNAME = "admin";
+const char* ADMIN_PASSWORD_DEFAULT = "admin";
+
+// Static IP settings
 IPAddress local_IP(192, 168, 100, 27);
 IPAddress gateway(192, 168, 100, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDNS(8, 8, 8, 8);
 
-#define MY_TZ         "PKT-5"
-#define RELAY_PIN     D5          // *** MOVED from D1 to free I2C pins ***
-#define NTP_SYNC_INTERVAL 3600    // Re-sync RTC from NTP every 1 hour (seconds)
+#define MY_TZ "PKT-5"                 // POSIX TZ string, no DST in Pakistan
+#define RELAY_PIN D5                  // GPIO14 — keep off D1/D2 (I2C)
+#define NTP_SYNC_INTERVAL   3600      // seconds between RTC re-syncs from NTP
+#define WIFI_CHECK_INTERVAL 30000     // ms between WiFi reconnect attempts
+#define MAX_EVENTS 100
+#define LABEL_LEN 25                  // 24 visible chars + null terminator
+#define MIN_SAFE_HEAP 4000            // bytes; restart if free heap drops below this
+#define NIGHTLY_RESTART_HOUR 3        // 03:00 local — outside school hours
 
-// ---------------- GLOBALS ----------------
+#define LED_PIN D7                    // GPIO13 — early-warning strobe LED
+#define WARNING_LEAD_SECONDS 10       // start strobing this many seconds before a bell
+#define STROBE_INTERVAL_MS     200    // blink speed during the pre-bell warning
+#define STROBE_INTERVAL_RING_MS 80    // faster blink speed while the bell is actually ringing
+
+#define RESET_BUTTON_PIN D6           // GPIO12 — hold LOW ~5s at power-up to reset password
+#define RESET_HOLD_MS 5000
+#define MAX_SESSIONS 3                // concurrent logged-in browsers
+#define SESSION_TOKEN_LEN 33          // 32 hex chars + null
+
+// ---------------------------------------------------------
+// GLOBALS
+// ---------------------------------------------------------
 ESP8266WebServer server(80);
 RTC_DS3231 rtc;
 bool rtcAvailable = false;
 
 struct BellEvent {
-  int  day;
-  int  hour;
-  int  minute;
-  bool pm;
+  uint8_t day;              // 0=Sun .. 6=Sat
+  uint8_t hour;              // 0-23 (24h internal format)
+  uint8_t minute;            // 0-59
+  uint8_t duration;          // seconds, 1-15
   bool enabled;
-  int  duration;  // seconds
+  char label[LABEL_LEN];     // optional, may be empty string
 };
 
-BellEvent schedule[100];
+BellEvent schedule[MAX_EVENTS];
 int eventCount = 0;
 
-// Bell state
-bool          bellActive        = false;
-unsigned long bellStartTime     = 0;
-int           currentRingDuration = 0;
+bool bellActive = false;
+unsigned long bellStartTime = 0;
+int currentRingDuration = 0;
 
-// Scheduler state
-int           lastMinuteChecked = -1;
+int lastMinuteChecked = -1;
 
-// NTP->RTC sync tracking
 unsigned long lastNtpSyncMillis = 0;
-bool          ntpSynced         = false;
+bool ntpSynced = false;
 
-// WiFi reconnect
-unsigned long lastWifiCheck     = 0;
-#define WIFI_CHECK_INTERVAL 30000  // check every 30s
+unsigned long lastWifiCheck = 0;
+
+bool warningActive = false;          // true when a bell is due within WARNING_LEAD_SECONDS
+bool ledStrobeState = false;
+unsigned long lastStrobeToggle = 0;
+
+char sessionTokens[MAX_SESSIONS][SESSION_TOKEN_LEN];   // zero-initialized (BSS) = all slots empty
+int nextSessionSlot = 0;
+String currentPassword;   // loaded at boot from LittleFS, falls back to ADMIN_PASSWORD_DEFAULT
 
 // ---------------------------------------------------------
 // TIME HELPERS
@@ -76,15 +217,16 @@ unsigned long lastWifiCheck     = 0;
 // Returns the best available time_t:
 //   1. NTP/system time if synced
 //   2. DS3231 RTC if available
-//   3. 0 (not available)
+//   3. 0 if no time source at all
+// Both paths are UTC-epoch time_t; the RTC stores local (PKT)
+// wall-clock values, and mktime() converts them using the TZ
+// configured in setup() — see setupTime().
 time_t getBestTime() {
   time_t now = time(nullptr);
-  if (now > 100000UL) {
-    return now;  // NTP/system time valid
-  }
+  if (now > 100000UL) return now;
+
   if (rtcAvailable) {
     DateTime dt = rtc.now();
-    // Convert DateTime to time_t manually
     struct tm t = {};
     t.tm_year = dt.year() - 1900;
     t.tm_mon  = dt.month() - 1;
@@ -93,503 +235,673 @@ time_t getBestTime() {
     t.tm_min  = dt.minute();
     t.tm_sec  = dt.second();
     t.tm_isdst = 0;
-    return mktime(&t);  // Returns UTC+5 since DS3231 is set in PKT
+    return mktime(&t);
   }
   return 0;
 }
 
-// Sync DS3231 from NTP once NTP is available
+// Sync DS3231 from NTP once NTP is available, then periodically.
 void syncRtcFromNtp() {
   time_t now = time(nullptr);
-  if (now < 100000UL) return;  // NTP not ready yet
-
+  if (now < 100000UL) return;      // NTP not ready yet
   if (!rtcAvailable) return;
 
   unsigned long ms = millis();
-  // Sync on first successful NTP, then every NTP_SYNC_INTERVAL seconds
   if (!ntpSynced || (ms - lastNtpSyncMillis >= (unsigned long)NTP_SYNC_INTERVAL * 1000UL)) {
     struct tm* t = localtime(&now);
     if (!t) return;
-    rtc.adjust(DateTime(
-      t->tm_year + 1900,
-      t->tm_mon  + 1,
-      t->tm_mday,
-      t->tm_hour,
-      t->tm_min,
-      t->tm_sec
-    ));
-    ntpSynced        = true;
+    rtc.adjust(DateTime(t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+                         t->tm_hour, t->tm_min, t->tm_sec));
+    ntpSynced = true;
     lastNtpSyncMillis = ms;
-    Serial.println("[RTC] Synced from NTP");
+    DBG_PRINTLN("[RTC] Synced from NTP");
   }
 }
 
-// ---------------------------------------------------------
-// SYSTEM FUNCTIONS
-// ---------------------------------------------------------
+// Sets the TZ unconditionally (fix #1 above). Safe to call before
+// WiFi connects — configTime() sets the TZ synchronously and just
+// queues the SNTP request until the network is up.
 void setupTime() {
   configTime(MY_TZ, "pool.ntp.org", "time.google.com");
 }
 
-void loadData() {
-  if (!LittleFS.exists("/data.json")) {
-    Serial.println("No data.json found, starting with empty schedule.");
-    return;
-  }
-
-  File f = LittleFS.open("/data.json", "r");
-  if (!f) {
-    Serial.println("Failed to open data.json");
-    return;
-  }
-
-  DynamicJsonDocument doc(8192);
-  DeserializationError err = deserializeJson(doc, f);
-  f.close();
-
-  if (err) {
-    Serial.print("JSON parse error: ");
-    Serial.println(err.c_str());
-    eventCount = 0;
-    return;
-  }
-
-  JsonArray arr = doc["events"].as<JsonArray>();
-  if (arr.isNull()) { eventCount = 0; return; }
-
-  eventCount = 0;
-  for (JsonObject o : arr) {
-    if (eventCount >= 100) break;
-    schedule[eventCount].day      = o["day"]     | 0;
-    schedule[eventCount].hour     = o["hour"]    | 8;
-    schedule[eventCount].minute   = o["minute"]  | 0;
-    schedule[eventCount].pm       = o["pm"]      | false;
-    schedule[eventCount].enabled  = o["enabled"] | true;
-    schedule[eventCount].duration = o["dur"]     | 3;
-    eventCount++;
-  }
-
-  Serial.print("Loaded events: ");
-  Serial.println(eventCount);
-}
-
+// ---------------------------------------------------------
+// PERSISTENCE  (LittleFS + ArduinoJson 7)
+// ---------------------------------------------------------
 void saveData() {
-  DynamicJsonDocument doc(8192);
-  JsonArray arr = doc.createNestedArray("events");
-
+  JsonDocument doc;
+  JsonArray arr = doc["events"].to<JsonArray>();
   for (int i = 0; i < eventCount; i++) {
-    JsonObject o = arr.createNestedObject();
+    JsonObject o = arr.add<JsonObject>();
     o["day"]     = schedule[i].day;
-    o["hour"]    = schedule[i].hour;
+    o["hour"]    = schedule[i].hour;      // 24h format
     o["minute"]  = schedule[i].minute;
-    o["pm"]      = schedule[i].pm;
     o["enabled"] = schedule[i].enabled;
     o["dur"]     = schedule[i].duration;
+    if (schedule[i].label[0] != '\0') o["label"] = schedule[i].label;
   }
-
   File f = LittleFS.open("/data.json", "w");
-  if (!f) { Serial.println("Failed to write data.json"); return; }
+  if (!f) { DBG_PRINTLN("[FS] Failed to open data.json for write"); return; }
   serializeJson(doc, f);
   f.close();
 }
 
-// ---------------------------------------------------------
-// WIFI RECONNECTION
+void loadData() {
+  eventCount = 0;
+  if (!LittleFS.exists("/data.json")) {
+    DBG_PRINTLN("[FS] No data.json found, starting with empty schedule.");
+    return;
+  }
+  File f = LittleFS.open("/data.json", "r");
+  if (!f) { DBG_PRINTLN("[FS] Failed to open data.json"); return; }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    DBG_PRINT("[FS] JSON parse error: ");
+    DBG_PRINTLN(err.c_str());
+    return;
+  }
+
+  JsonArray arr = doc["events"].as<JsonArray>();
+  if (arr.isNull()) return;
+
+  bool legacyFormatFound = false;
+  for (JsonObject o : arr) {
+    if (eventCount >= MAX_EVENTS) break;
+    BellEvent &e = schedule[eventCount];
+    e.day = o["day"] | 0;
+
+    if (o["pm"].is<bool>()) {
+      // Legacy v1 record: 12h "hour" (1-12) + "pm" bool -> migrate to 24h.
+      legacyFormatFound = true;
+      int h12 = o["hour"] | 12;
+      bool pm = o["pm"] | false;
+      e.hour = (h12 % 12) + (pm ? 12 : 0);
+    } else {
+      e.hour = o["hour"] | 8;             // already 24h format
+    }
+
+    e.minute   = o["minute"] | 0;
+    e.enabled  = o["enabled"] | true;
+    e.duration = o["dur"] | 3;
+
+    const char* lbl = o["label"] | "";
+    strncpy(e.label, lbl, LABEL_LEN - 1);
+    e.label[LABEL_LEN - 1] = '\0';
+
+    eventCount++;
+  }
+
+  DBG_PRINTF("[FS] Loaded %d event(s)%s\n", eventCount,
+                legacyFormatFound ? " (migrated from legacy 12h format)" : "");
+
+  if (legacyFormatFound) saveData();      // persist the migration once
+}
+
+// Password is stored separately from the schedule so a factory-default
+// reset (physical button) can wipe just this file without touching the
+// bell schedule. Falls back to the compiled-in default if absent/corrupt.
+void loadAuthConfig() {
+  currentPassword = ADMIN_PASSWORD_DEFAULT;
+  if (!LittleFS.exists("/auth.json")) return;
+  File f = LittleFS.open("/auth.json", "r");
+  if (!f) return;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) { DBG_PRINTLN("[AUTH] auth.json parse error, using default password"); return; }
+  const char* pw = doc["password"] | "";
+  if (pw[0] != '\0') currentPassword = String(pw);
+}
+
+void saveAuthConfig() {
+  JsonDocument doc;
+  doc["password"] = currentPassword;
+  File f = LittleFS.open("/auth.json", "w");
+  if (!f) { DBG_PRINTLN("[AUTH] Failed to open auth.json for write"); return; }
+  serializeJson(doc, f);
+  f.close();
+}
+
+
 // ---------------------------------------------------------
 void maintainWifi() {
   if (millis() - lastWifiCheck < WIFI_CHECK_INTERVAL) return;
   lastWifiCheck = millis();
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Disconnected, reconnecting...");
+    DBG_PRINTLN("[WiFi] Disconnected, reconnecting...");
     WiFi.disconnect();
     WiFi.begin(ssid, password);
-    // Non-blocking: next check in 30s will verify
-    setupTime();  // re-init NTP in case it dropped
+    setupTime();   // harmless if TZ already set; re-queues NTP sync
   }
 }
 
 // ---------------------------------------------------------
-// BELL LOGIC
+// BELL
 // ---------------------------------------------------------
 void triggerBell(int durationSecs) {
   if (!bellActive) {
-    digitalWrite(RELAY_PIN, LOW);   // Relay ON (active-low)
-    bellActive           = true;
-    bellStartTime        = millis();
-    currentRingDuration  = durationSecs;
-    Serial.print("[Bell] Ringing for ");
-    Serial.print(durationSecs);
-    Serial.println("s");
+    digitalWrite(RELAY_PIN, LOW);   // active-low relay: LOW = ON
+    bellActive = true;
+    bellStartTime = millis();
+    currentRingDuration = durationSecs;
+    DBG_PRINTF("[Bell] Ringing for %ds\n", durationSecs);
   }
 }
 
 void handleBellState() {
-  if (bellActive) {
-    if (millis() - bellStartTime >= (unsigned long)currentRingDuration * 1000UL) {
-      digitalWrite(RELAY_PIN, HIGH);  // Relay OFF
-      bellActive = false;
-      Serial.println("[Bell] OFF");
-    }
+  if (bellActive && millis() - bellStartTime >= (unsigned long)currentRingDuration * 1000UL) {
+    digitalWrite(RELAY_PIN, HIGH);  // OFF
+    bellActive = false;
+    DBG_PRINTLN("[Bell] OFF");
   }
 }
 
 // ---------------------------------------------------------
-// WEB UI
+// SCHEDULER
 // ---------------------------------------------------------
-String getDayName(int d) {
-  const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-  return (d >= 0 && d <= 6) ? days[d] : "?";
-}
+void checkSchedule() {
+  time_t now = getBestTime();
+  if (now == 0) return;
+  struct tm* t = localtime(&now);
+  if (!t) return;
 
-// Returns time source label for the UI
-String timeSourceLabel() {
-  time_t now = time(nullptr);
-  if (now > 100000UL) return ntpSynced ? "NTP" : "NTP(sync)";
-  if (rtcAvailable)   return "RTC";
-  return "No Time";
-}
+  if (t->tm_min == lastMinuteChecked) return;   // only fire once per minute
+  lastMinuteChecked = t->tm_min;
 
-String htmlPage() {
-  String p;
-  p.reserve(16000);  // BUG FIX: was 6000, too small for many events
-
-  p += R"====(
-<!DOCTYPE html><html><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Bell</title>
-<style>
-  body { background:#484848; color:white; font-family:'Segoe UI',sans-serif; margin:0; padding:20px; }
-  .container { max-width:900px; margin:auto; }
-  .header { display:flex; justify-content:space-between; align-items:center; padding-bottom:20px; }
-  h1 { margin:0; font-size:22px; font-weight:600; }
-  h2 { margin:0; font-size:16px; opacity:.8; }
-  .status-panel { text-align:right; }
-  .time-display { font-size:18px; font-family:monospace; display:block; margin-bottom:3px; }
-  .time-source  { font-size:11px; opacity:.6; display:block; margin-bottom:5px; }
-  .btn { border:none; padding:8px 16px; border-radius:20px; color:white; cursor:pointer; font-weight:bold; text-decoration:none; display:inline-block; }
-  .btn-purple { background:#673AB7; }
-  .btn-purple:hover { background:#7E57C2; }
-  .day-selector { display:flex; gap:5px; flex-wrap:wrap; margin-bottom:10px; }
-  .day-checkbox { display:none; }
-  .day-label { padding:8px 12px; background:#666; border-radius:4px; cursor:pointer; user-select:none; font-size:14px; }
-  .day-checkbox:checked + .day-label { background:#673AB7; color:#fff; border:1px solid #9575cd; }
-  input, select { background:transparent; border:none; border-bottom:1px solid white; color:white; padding:5px; font-size:16px; text-align:center; }
-  select { background:#555; }
-  .event-list { background:#333; border-radius:8px; padding:10px; margin-top:20px; }
-  .event-item { display:flex; justify-content:space-between; padding:10px; border-bottom:1px solid #555; align-items:center; }
-  .time-col { width:120px; font-weight:bold; font-size:1.1em; }
-  .dur-col  { width:80px; color:#bbb; }
-  .del-btn  { color:#F44336; text-decoration:none; font-weight:bold; margin-left:10px; cursor:pointer; }
-  .rtc-badge { background:#1565C0; color:#fff; font-size:10px; padding:2px 6px; border-radius:10px; margin-left:6px; }
-  .ntp-badge { background:#2E7D32; color:#fff; font-size:10px; padding:2px 6px; border-radius:10px; margin-left:6px; }
-</style>
-<script>
-  setInterval(function() {
-    fetch('/time').then(r=>r.json()).then(d=>{
-      document.getElementById('clock').innerText  = d.time;
-      document.getElementById('tsrc').innerText   = 'Source: ' + d.source;
-      document.getElementById('tsrc').style.color = d.source==='NTP' ? '#66BB6A' : (d.source==='RTC' ? '#42A5F5' : '#EF5350');
-    });
-  }, 1000);
-
-  function confirmClear() {
-    if(confirm("Are you sure you want to DELETE ALL schedules? This cannot be undone.")) {
-      location.href="/clear";
-    }
-  }
-</script>
-</head><body>
-<div class="container">
-  <div class="header">
-    <div><h1>Nasir Higher Secondary School</h1><h2>Smart Bell System &#8212; Rabwah</h2></div>
-    <div class="status-panel">
-      <span class="time-display" id="clock">Loading...</span>
-      <span class="time-source"  id="tsrc">Source: ...</span>
-      <a href="/manual" class="btn btn-purple">&#128276; Ring (5s)</a>
-    </div>
-  </div>
-  <hr style="border:0; border-top:1px solid #777;">
-
-  <div style="background:#3a3a3a; padding:15px; border-radius:8px;">
-    <form action="/add" method="GET">
-      <div style="margin-bottom:10px; font-weight:bold; color:#ddd;">Select Days:</div>
-      <div class="day-selector">
-        <input type="checkbox" id="d1" name="d1" class="day-checkbox" checked><label for="d1" class="day-label">Mon</label>
-        <input type="checkbox" id="d2" name="d2" class="day-checkbox" checked><label for="d2" class="day-label">Tue</label>
-        <input type="checkbox" id="d3" name="d3" class="day-checkbox" checked><label for="d3" class="day-label">Wed</label>
-        <input type="checkbox" id="d4" name="d4" class="day-checkbox" checked><label for="d4" class="day-label">Thu</label>
-        <input type="checkbox" id="d5" name="d5" class="day-checkbox"><label for="d5" class="day-label">Fri</label>
-        <input type="checkbox" id="d6" name="d6" class="day-checkbox"><label for="d6" class="day-label">Sat</label>
-        <input type="checkbox" id="d0" name="d0" class="day-checkbox" checked><label for="d0" class="day-label">Sun</label>
-      </div>
-      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:15px;">
-        <b>Time:</b>
-        <input type="number" name="hour"   min="1"  max="12" value="8"  style="width:40px"> :
-        <input type="number" name="minute" min="0"  max="59" value="00" style="width:40px">
-        <select name="ampm" style="background:#673AB7; border-radius:4px;">
-          <option value="0">AM</option><option value="1">PM</option>
-        </select>
-        <span style="margin-left:10px;"><b>Duration:</b></span>
-        <input type="number" name="dur" min="1" max="15" value="3" style="width:40px">s
-        <button type="submit" class="btn btn-purple" style="margin-left:auto;">ADD TO SCHEDULE</button>
-      </div>
-    </form>
-  </div>
-
-  <div class="event-list">
-    <div style="display:flex; justify-content:space-between; margin-bottom:10px; align-items:center;">
-      <b>Scheduled Bells</b>
-      <div>
-        <span style="margin-right:15px;">Total: )====";
-
-  p += String(eventCount);
-  p += R"====(</span>
-        <a href="#" onclick="confirmClear()" style="color:#F44336; font-size:12px; border:1px solid #F44336; padding:3px 8px; border-radius:4px; text-decoration:none;">DELETE ALL</a>
-      </div>
-    </div>
-)====";
+  int d = t->tm_wday, h = t->tm_hour, m = t->tm_min;
 
   for (int i = 0; i < eventCount; i++) {
-    p += "<div class='event-item'>";
-    p += "<span style='width:50px; color:#bbb;'>" + getDayName(schedule[i].day) + "</span>";
-    p += "<span class='time-col'>" + String(schedule[i].hour) + ":";
-    if (schedule[i].minute < 10) p += "0";
-    p += String(schedule[i].minute) + (schedule[i].pm ? " PM" : " AM") + "</span>";
-    p += "<span class='dur-col'>[ " + String(schedule[i].duration) + "s ]</span>";
-    p += "<span>";
-    if (schedule[i].enabled)
-      p += "<span style='color:#4CAF50; font-weight:bold;'>ON</span>";
-    else
-      p += "<span style='color:#777; font-weight:bold;'>OFF</span>";
-    p += "<a href='/del?id=" + String(i) + "' class='del-btn'>&#10006;</a>";
-    p += "</span></div>";
+    if (!schedule[i].enabled || schedule[i].day != d) continue;
+    if (schedule[i].hour == h && schedule[i].minute == m) {
+      triggerBell(schedule[i].duration);
+      break;   // one event per minute
+    }
   }
-
-  p += "</div>";
-
-  // RTC status footer
-  p += "<div style='margin-top:15px; font-size:12px; color:#aaa; background:#2a2a2a; padding:8px 12px; border-radius:6px;'>";
-  p += "<b>Time Source:</b> ";
-  if (WiFi.status() == WL_CONNECTED) {
-    p += "<span style='color:#66BB6A;'>&#9679; WiFi Connected</span>";
-  } else {
-    p += "<span style='color:#EF5350;'>&#9679; WiFi Offline</span>";
-  }
-  p += " &nbsp;|&nbsp; <b>RTC:</b> ";
-  if (rtcAvailable) {
-    p += "<span style='color:#42A5F5;'>&#9679; DS3231 OK</span>";
-    if (ntpSynced) p += " <span style='color:#aaa;'>(last synced from NTP)</span>";
-    else           p += " <span style='color:#FFA726;'>(NTP not yet synced)</span>";
-  } else {
-    p += "<span style='color:#EF5350;'>&#9679; Not found</span>";
-  }
-  p += "</div>";
-
-  p += "</div></body></html>";
-  return p;
 }
+
+// ---------------------------------------------------------
+// EARLY-WARNING LED
+// ---------------------------------------------------------
+// Checked once per second: is any enabled event today due within the
+// next WARNING_LEAD_SECONDS? (Doesn't look across midnight — fine for
+// school hours, where nothing is scheduled within 10s of 00:00.)
+void updateWarningState() {
+  time_t now = getBestTime();
+  if (now == 0) { warningActive = false; return; }
+  struct tm* t = localtime(&now);
+  if (!t) { warningActive = false; return; }
+
+  int d = t->tm_wday;
+  long nowSec = (long)t->tm_hour * 3600L + (long)t->tm_min * 60L + t->tm_sec;
+
+  bool found = false;
+  for (int i = 0; i < eventCount; i++) {
+    if (!schedule[i].enabled || schedule[i].day != d) continue;
+    long evSec = (long)schedule[i].hour * 3600L + (long)schedule[i].minute * 60L;
+    long delta = evSec - nowSec;
+    if (delta > 0 && delta <= WARNING_LEAD_SECONDS) { found = true; break; }
+  }
+  warningActive = found;
+}
+
+// Called every loop() iteration — the actual blink timing needs
+// sub-second resolution, so this can't live in the 1Hz block.
+// Speeds up automatically once bellActive (the ring itself) takes over.
+void serviceWarningLed() {
+  if (!warningActive && !bellActive) {
+    if (ledStrobeState) { ledStrobeState = false; digitalWrite(LED_PIN, LOW); }
+    return;
+  }
+  unsigned long interval = bellActive ? STROBE_INTERVAL_RING_MS : STROBE_INTERVAL_MS;
+  unsigned long ms = millis();
+  if (ms - lastStrobeToggle >= interval) {
+    lastStrobeToggle = ms;
+    ledStrobeState = !ledStrobeState;
+    digitalWrite(LED_PIN, ledStrobeState ? HIGH : LOW);
+  }
+}
+
+// ---------------------------------------------------------
+// SELF-HEALING
+// ---------------------------------------------------------
+void checkSystemHealth() {
+  static unsigned long lastHeapCheck = 0;
+  static int lastRestartYday = -1;
+
+  if (millis() - lastHeapCheck >= 60000UL) {
+    lastHeapCheck = millis();
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < MIN_SAFE_HEAP) {
+      DBG_PRINTF("[HEALTH] Free heap critically low (%u bytes) - restarting\n", freeHeap);
+      delay(200);
+      ESP.restart();
+    }
+  }
+
+  time_t now = getBestTime();
+  if (now == 0) return;
+  struct tm* t = localtime(&now);
+  if (!t) return;
+
+  if (t->tm_hour == NIGHTLY_RESTART_HOUR && t->tm_min == 0 &&
+      !bellActive && lastRestartYday != t->tm_yday) {
+    lastRestartYday = t->tm_yday;
+    DBG_PRINTLN("[HEALTH] Scheduled nightly restart");
+    delay(200);
+    ESP.restart();
+  }
+}
+
+// ---------------------------------------------------------
+// AUTH  (session-cookie login, single shared admin account)
+// ---------------------------------------------------------
+// Not encrypted transport (plain HTTP) — this stops casual/opportunistic
+// access on the LAN, not a determined attacker sniffing traffic. See the
+// wiring note at the top of this file for the physical recovery button.
+
+String extractSessionToken() {
+  if (!server.hasHeader("Cookie")) return "";
+  String cookie = server.header("Cookie");
+  int idx = cookie.indexOf("session=");
+  if (idx == -1) return "";
+  idx += 8;
+  int end = cookie.indexOf(';', idx);
+  String token = (end == -1) ? cookie.substring(idx) : cookie.substring(idx, end);
+  token.trim();
+  return token;
+}
+
+bool isAuthenticated() {
+  String token = extractSessionToken();
+  if (token.length() == 0) return false;
+  for (int i = 0; i < MAX_SESSIONS; i++) {
+    if (sessionTokens[i][0] != '\0' && token.equals(sessionTokens[i])) return true;
+  }
+  return false;
+}
+
+String generateSessionToken() {
+  const char* hexChars = "0123456789abcdef";
+  char buf[SESSION_TOKEN_LEN];
+  for (int i = 0; i < SESSION_TOKEN_LEN - 1; i++) buf[i] = hexChars[random(16)];
+  buf[SESSION_TOKEN_LEN - 1] = '\0';
+  return String(buf);
+}
+
+void clearAllSessions() {
+  for (int i = 0; i < MAX_SESSIONS; i++) sessionTokens[i][0] = '\0';
+}
+
+void sendUnauthorized() {
+  JsonDocument doc;
+  doc["ok"] = false;
+  doc["message"] = "Not authenticated";
+  String out;
+  serializeJson(doc, out);
+  server.send(401, "application/json", out);
+}
+
+void redirectToLogin() {
+  server.sendHeader("Location", "/login");
+  server.send(302, "text/plain", "");
+}
+
+#include "login_page.h"
+
+void handleLoginPage() {
+  server.send_P(200, "text/html", LOGIN_HTML);
+}
+
+void handleLoginPost() {
+  String u = server.hasArg("username") ? server.arg("username") : "";
+  String p = server.hasArg("password") ? server.arg("password") : "";
+
+  if (u == ADMIN_USERNAME && p == currentPassword) {
+    String token = generateSessionToken();
+    strncpy(sessionTokens[nextSessionSlot], token.c_str(), SESSION_TOKEN_LEN - 1);
+    sessionTokens[nextSessionSlot][SESSION_TOKEN_LEN - 1] = '\0';
+    nextSessionSlot = (nextSessionSlot + 1) % MAX_SESSIONS;
+
+    server.sendHeader("Set-Cookie", "session=" + token + "; Path=/; HttpOnly");
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+  } else {
+    server.sendHeader("Location", "/login?error=1");
+    server.send(302, "text/plain", "");
+  }
+}
+
+void handleLogout() {
+  String token = extractSessionToken();
+  if (token.length() > 0) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+      if (sessionTokens[i][0] != '\0' && token.equals(sessionTokens[i])) { sessionTokens[i][0] = '\0'; break; }
+    }
+  }
+  server.sendHeader("Set-Cookie", "session=; Path=/; Max-Age=0");
+  redirectToLogin();
+}
+
+void handleChangePassword() {
+  if (!isAuthenticated()) { sendUnauthorized(); return; }
+  if (!server.hasArg("current") || !server.hasArg("newpass")) { sendResult(false, "Missing fields"); return; }
+  if (server.arg("current") != currentPassword) { sendResult(false, "Current password is incorrect"); return; }
+  String np = server.arg("newpass");
+  if (np.length() < 4) { sendResult(false, "New password must be at least 4 characters"); return; }
+  currentPassword = np;
+  saveAuthConfig();
+  sendResult(true);
+}
+
+// Checked once at boot, before WiFi. Hold the button LOW (D6 to GND) for
+// RESET_HOLD_MS to wipe the stored password and any active sessions,
+// restoring ADMIN_PASSWORD_DEFAULT — this is the "forgot password" path.
+// Requires physical access to the device, same as WiFi/relay wiring does.
+void checkPasswordResetButton() {
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  if (digitalRead(RESET_BUTTON_PIN) != LOW) return;
+
+  DBG_PRINTLN("[AUTH] Reset button held at boot - keep holding to confirm...");
+  unsigned long start = millis();
+  while (millis() - start < RESET_HOLD_MS) {
+    if (digitalRead(RESET_BUTTON_PIN) != LOW) {
+      DBG_PRINTLN("[AUTH] Button released early - reset cancelled");
+      return;
+    }
+    delay(50);
+  }
+
+  DBG_PRINTLN("[AUTH] Resetting password to factory default");
+  if (LittleFS.exists("/auth.json")) LittleFS.remove("/auth.json");
+  currentPassword = ADMIN_PASSWORD_DEFAULT;
+  clearAllSessions();
+
+  // Confirm visually even with no serial connected.
+  pinMode(LED_PIN, OUTPUT);
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(120);
+    digitalWrite(LED_PIN, LOW);  delay(120);
+  }
+}
+
+// ---------------------------------------------------------
+// WEB UI  (static PROGMEM shell, no per-request rebuilding)
+// ---------------------------------------------------------
+#include "page.h"
+
 
 // ---------------------------------------------------------
 // ROUTE HANDLERS
 // ---------------------------------------------------------
-void redirect() {
-  server.sendHeader("Location", "/");
-  server.send(303);
-}
-
 void handleRoot() {
-  server.send(200, "text/html", htmlPage());
+  if (!isAuthenticated()) { redirectToLogin(); return; }
+  server.send_P(200, "text/html", PAGE_HTML);
 }
 
-// Returns JSON with time + source so UI can colour-code the clock
-void handleTime() {
+String timeSourceLabel() {
+  time_t now = time(nullptr);
+  if (now > 100000UL) return ntpSynced ? "NTP" : "NTP(sync)";
+  if (rtcAvailable) return "RTC";
+  return "No Time";
+}
+
+void handleApiStatus() {
+  if (!isAuthenticated()) { sendUnauthorized(); return; }
   time_t now = getBestTime();
-  String source = timeSourceLabel();
-  String timeStr;
+  struct tm* t = (now > 0) ? localtime(&now) : nullptr;
 
-  if (now > 0) {
-    struct tm* t = localtime(&now);
-    char buf[20];
-    strftime(buf, sizeof(buf), "%I:%M:%S %p", t);
-    timeStr = String(buf);
+  JsonDocument doc;
+  if (t) {
+    doc["valid"]   = true;
+    doc["hour"]    = t->tm_hour;
+    doc["minute"]  = t->tm_min;
+    doc["second"]  = t->tm_sec;
+    doc["weekday"] = t->tm_wday;
   } else {
-    timeStr = "--:--:-- --";
+    doc["valid"] = false;
   }
+  doc["source"]     = timeSourceLabel();
+  doc["wifi"]       = (WiFi.status() == WL_CONNECTED);
+  doc["rtc"]        = rtcAvailable;
+  doc["ntpSynced"]  = ntpSynced;
+  doc["eventCount"] = eventCount;
+  doc["bellActive"] = bellActive;
+  doc["freeHeap"]   = ESP.getFreeHeap();
+  doc["uptimeSec"]  = millis() / 1000;
 
-  // Return JSON
-  String json = "{\"time\":\"" + timeStr + "\",\"source\":\"" + source + "\"}";
-  server.send(200, "application/json", json);
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
-void handleManual() {
-  triggerBell(5);
-  redirect();
+void handleApiEvents() {
+  if (!isAuthenticated()) { sendUnauthorized(); return; }
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < eventCount; i++) {
+    JsonObject o = arr.add<JsonObject>();
+    o["id"]      = i;
+    o["day"]     = schedule[i].day;
+    o["hour"]    = schedule[i].hour;
+    o["minute"]  = schedule[i].minute;
+    o["enabled"] = schedule[i].enabled;
+    o["duration"]= schedule[i].duration;
+    o["label"]   = schedule[i].label;
+  }
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
-void handleAdd() {
+void sendResult(bool ok, const char* msg) {
+  JsonDocument doc;
+  doc["ok"] = ok;
+  if (msg[0] != '\0') doc["message"] = msg;
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+void sendResult(bool ok) { sendResult(ok, ""); }
+
+static void setLabel(char* dest, const String& src) {
+  String s = src;
+  if (s.length() > LABEL_LEN - 1) s = s.substring(0, LABEL_LEN - 1);
+  strncpy(dest, s.c_str(), LABEL_LEN - 1);
+  dest[LABEL_LEN - 1] = '\0';
+}
+
+void handleApiAdd() {
+  if (!isAuthenticated()) { sendUnauthorized(); return; }
   if (!server.hasArg("hour") || !server.hasArg("minute") || !server.hasArg("ampm")) {
-    redirect();
+    sendResult(false, "Missing fields");
     return;
   }
+  int dur = server.hasArg("dur") ? constrain(server.arg("dur").toInt(), 1, 15) : 3;
+  int h12 = constrain(server.arg("hour").toInt(), 1, 12);
+  int m   = constrain(server.arg("minute").toInt(), 0, 59);
+  bool pm = server.arg("ampm").toInt() != 0;
+  int h24 = (h12 % 12) + (pm ? 12 : 0);
+  String label = server.hasArg("label") ? server.arg("label") : "";
 
-  int dur = 3;
-  if (server.hasArg("dur")) {
-    dur = server.arg("dur").toInt();
-    dur = constrain(dur, 1, 15);
-  }
-
-  int  h  = server.arg("hour").toInt();
-  int  m  = server.arg("minute").toInt();
-  bool pm = (server.arg("ampm").toInt() != 0);
-
-  h = constrain(h, 1, 12);
-  m = constrain(m, 0, 59);
+  int added = 0, updated = 0;
+  bool full = false;
 
   for (int d = 0; d <= 6; d++) {
-    String argName = "d" + String(d);
-    if (!server.hasArg(argName)) continue;
+    if (!server.hasArg("d" + String(d))) continue;
 
-    // Update if duplicate day+time exists
     bool found = false;
     for (int i = 0; i < eventCount; i++) {
-      if (schedule[i].day    == d &&
-          schedule[i].hour   == h &&
-          schedule[i].minute == m &&
-          schedule[i].pm     == pm) {
+      if (schedule[i].day == d && schedule[i].hour == h24 && schedule[i].minute == m) {
         schedule[i].duration = dur;
-        schedule[i].enabled  = true;
+        schedule[i].enabled = true;
+        setLabel(schedule[i].label, label);
         found = true;
+        updated++;
         break;
       }
     }
-
-    if (!found && eventCount < 100) {
-      schedule[eventCount] = {d, h, m, pm, true, dur};
+    if (!found) {
+      if (eventCount >= MAX_EVENTS) { full = true; continue; }
+      BellEvent &e = schedule[eventCount];
+      e.day = d; e.hour = h24; e.minute = m; e.duration = dur; e.enabled = true;
+      setLabel(e.label, label);
       eventCount++;
+      added++;
     }
   }
+
+  if (added == 0 && updated == 0) {
+    sendResult(false, full ? "Schedule full (100 events max)" : "Select at least one day");
+    return;
+  }
+  saveData();
+  sendResult(true);
+}
+
+void handleApiUpdate() {
+  if (!isAuthenticated()) { sendUnauthorized(); return; }
+  if (!server.hasArg("id")) { sendResult(false, "Missing id"); return; }
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= eventCount) { sendResult(false, "Invalid id"); return; }
+
+  if (server.hasArg("day")) schedule[id].day = constrain(server.arg("day").toInt(), 0, 6);
+  if (server.hasArg("hour") && server.hasArg("ampm")) {
+    int h12 = constrain(server.arg("hour").toInt(), 1, 12);
+    bool pm = server.arg("ampm").toInt() != 0;
+    schedule[id].hour = (h12 % 12) + (pm ? 12 : 0);
+  }
+  if (server.hasArg("minute")) schedule[id].minute = constrain(server.arg("minute").toInt(), 0, 59);
+  if (server.hasArg("dur"))    schedule[id].duration = constrain(server.arg("dur").toInt(), 1, 15);
+  if (server.hasArg("label"))  setLabel(schedule[id].label, server.arg("label"));
 
   saveData();
-  redirect();
+  sendResult(true);
 }
 
-void handleDelete() {
-  if (server.hasArg("id")) {
-    int id = server.arg("id").toInt();
-    if (id >= 0 && id < eventCount) {
-      for (int i = id; i < eventCount - 1; i++) schedule[i] = schedule[i + 1];
-      eventCount--;
-      saveData();
-    }
-  }
-  redirect();
+void handleApiToggle() {
+  if (!isAuthenticated()) { sendUnauthorized(); return; }
+  if (!server.hasArg("id")) { sendResult(false, "Missing id"); return; }
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= eventCount) { sendResult(false, "Invalid id"); return; }
+  schedule[id].enabled = !schedule[id].enabled;
+  saveData();
+  sendResult(true);
 }
 
-void handleClear() {
+void handleApiDelete() {
+  if (!isAuthenticated()) { sendUnauthorized(); return; }
+  if (!server.hasArg("id")) { sendResult(false, "Missing id"); return; }
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= eventCount) { sendResult(false, "Invalid id"); return; }
+  for (int i = id; i < eventCount - 1; i++) schedule[i] = schedule[i + 1];
+  eventCount--;
+  saveData();
+  sendResult(true);
+}
+
+void handleApiClear() {
+  if (!isAuthenticated()) { sendUnauthorized(); return; }
   eventCount = 0;
   saveData();
-  redirect();
+  sendResult(true);
 }
 
-// ---------------------------------------------------------
-// SCHEDULE CHECKER
-// ---------------------------------------------------------
-void checkSchedule() {
-  time_t now = getBestTime();  // Uses RTC if NTP unavailable
-  if (now == 0) return;        // No time source at all
-
-  struct tm* t = localtime(&now);
-  if (!t) return;
-
-  // Guard: only fire once per minute
-  if (t->tm_min == lastMinuteChecked) return;
-  lastMinuteChecked = t->tm_min;
-
-  int d = t->tm_wday;
-  int h = t->tm_hour;
-  int m = t->tm_min;
-
-  for (int i = 0; i < eventCount; i++) {
-    if (!schedule[i].enabled || schedule[i].day != d) continue;
-
-    // Convert stored 12hr+pm to 24hr for comparison
-    int eh = schedule[i].hour % 12;  // 12->0, others unchanged
-    if (schedule[i].pm) eh += 12;
-
-    if (eh == h && schedule[i].minute == m) {
-      triggerBell(schedule[i].duration);
-      break;  // Only one event per minute
-    }
-  }
+void handleApiRing() {
+  if (!isAuthenticated()) { sendUnauthorized(); return; }
+  triggerBell(5);
+  sendResult(true);
 }
 
 // ---------------------------------------------------------
 // SETUP
 // ---------------------------------------------------------
 void setup() {
-  Serial.begin(115200);
+  DBG_BEGIN(115200);
   delay(100);
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);  // Relay OFF initially (active-low)
+  digitalWrite(RELAY_PIN, HIGH);   // relay OFF initially (active-low)
 
-  // Init I2C for DS3231
-  Wire.begin();  // SDA=D2, SCL=D1 by default on ESP8266
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);      // LED off initially (active-high)
+
+  // Note: no randomSeed() call here on purpose. On the ESP8266 core,
+  // random() draws from the hardware RNG by default; calling randomSeed()
+  // switches it to a deterministic software sequence instead, which would
+  // make session tokens *more* predictable, not less.
+
+  // Mount LittleFS first — both the schedule and the auth config live here,
+  // and the reset button needs it before WiFi/RTC are touched.
+  bool fsOk = LittleFS.begin();
+  if (!fsOk) DBG_PRINTLN("[FS] LittleFS mount failed!");
+
+  // Hold D6 to GND for 5s at power-up to restore the default password.
+  // Blocking here is fine — this only runs if someone is deliberately
+  // holding a button during boot.
+  if (fsOk) checkPasswordResetButton();
+
+  loadAuthConfig();
+  if (fsOk) loadData();
+
+  // Set TZ unconditionally, before WiFi — see "WHAT CHANGED IN v2" #1.
+  setupTime();
+
+  Wire.begin();   // SDA=D2, SCL=D1
   if (rtc.begin()) {
     rtcAvailable = true;
-    Serial.println("[RTC] DS3231 found");
+    DBG_PRINTLN("[RTC] DS3231 found");
     if (rtc.lostPower()) {
-      Serial.println("[RTC] WARNING: RTC lost power, time may be wrong until NTP sync!");
-      // Time will be corrected on first NTP sync
+      DBG_PRINTLN("[RTC] WARNING: lost power, time may be wrong until NTP sync");
     } else {
-      Serial.println("[RTC] Time retained from battery backup");
       DateTime now = rtc.now();
-      Serial.printf("[RTC] Current RTC time: %04d-%02d-%02d %02d:%02d:%02d\n",
-        now.year(), now.month(), now.day(),
-        now.hour(), now.minute(), now.second());
+      DBG_PRINTF("[RTC] Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                    now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
     }
   } else {
     rtcAvailable = false;
-    Serial.println("[RTC] DS3231 NOT found - running on NTP only");
+    DBG_PRINTLN("[RTC] DS3231 NOT found - running on NTP only");
   }
 
-  if (!LittleFS.begin()) {
-    Serial.println("[FS] LittleFS mount failed!");
-  } else {
-    loadData();
-  }
-
-  // Configure static IP before WiFi.begin
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
-    Serial.println("[WiFi] Static IP config failed");
+    DBG_PRINTLN("[WiFi] Static IP config failed");
   }
-
   WiFi.begin(ssid, password);
-  Serial.print("[WiFi] Connecting");
+  DBG_PRINT("[WiFi] Connecting");
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
-    Serial.print(".");
+    DBG_PRINT(".");
     attempts++;
   }
-
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] Connected: " + WiFi.localIP().toString());
-    setupTime();
+    DBG_PRINTLN("\n[WiFi] Connected: " + WiFi.localIP().toString());
   } else {
-    Serial.println("\n[WiFi] Failed to connect - running on RTC time only");
+    DBG_PRINTLN("\n[WiFi] Failed to connect - running on RTC time only");
   }
 
-  server.on("/",       handleRoot);
-  server.on("/time",   handleTime);
-  server.on("/manual", handleManual);
-  server.on("/add",    handleAdd);
-  server.on("/del",    handleDelete);
-  server.on("/clear",  handleClear);
+  server.collectHeaders("Cookie");
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/login", HTTP_GET, handleLoginPage);
+  server.on("/login", HTTP_POST, handleLoginPost);
+  server.on("/logout", HTTP_GET, handleLogout);
+  server.on("/api/account/password", HTTP_POST, handleChangePassword);
+  server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/events", HTTP_GET, handleApiEvents);
+  server.on("/api/events/add", HTTP_POST, handleApiAdd);
+  server.on("/api/events/update", HTTP_POST, handleApiUpdate);
+  server.on("/api/events/toggle", HTTP_POST, handleApiToggle);
+  server.on("/api/events/delete", HTTP_POST, handleApiDelete);
+  server.on("/api/events/clear", HTTP_POST, handleApiClear);
+  server.on("/api/ring", HTTP_POST, handleApiRing);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+
   server.begin();
-  Serial.println("[HTTP] Server started");
+  DBG_PRINTLN("[HTTP] Server started");
 }
 
 // ---------------------------------------------------------
@@ -598,13 +910,16 @@ void setup() {
 void loop() {
   server.handleClient();
   handleBellState();
+  serviceWarningLed();   // needs sub-second resolution, runs every iteration
 
-  static unsigned long lastScheduleCheck = 0;
-  if (millis() - lastScheduleCheck >= 1000UL) {
-    lastScheduleCheck = millis();
+  static unsigned long lastTick = 0;
+  if (millis() - lastTick >= 1000UL) {
+    lastTick = millis();
     checkSchedule();
-    syncRtcFromNtp();   // Update RTC if NTP just became available
+    syncRtcFromNtp();
+    checkSystemHealth();
+    updateWarningState();
   }
 
-  maintainWifi();       // Reconnect WiFi if dropped
+  maintainWifi();
 }
